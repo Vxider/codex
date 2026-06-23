@@ -1,14 +1,18 @@
-//! Transport-neutral messages for the callback-only code-mode host boundary.
+//! Messages and local IPC framing for the callback-only code-mode host boundary.
 //!
 //! Protocol version 1 relies on ordered framing and connection-scoped
 //! fail-stop behavior rather than message sequence numbers. It defines no
 //! optional capabilities yet; capability names provide an extension point for
 //! later versions without weakening the v1 decoder.
 
+mod codec;
 mod error;
 mod message;
 mod types;
 
+pub use codec::FramedReader;
+pub use codec::FramedWriter;
+pub use codec::MAX_FRAME_BYTES;
 pub use error::HandshakeRejectReason;
 pub use message::ClientHello;
 pub use message::ClientHelloError;
@@ -27,3 +31,7 @@ pub use types::SupportedProtocolVersions;
 #[cfg(test)]
 #[path = "host_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "codec_tests.rs"]
+mod codec_tests;

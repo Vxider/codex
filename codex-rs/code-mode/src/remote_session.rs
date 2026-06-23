@@ -1,6 +1,5 @@
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 
@@ -33,9 +32,7 @@ impl ProcessOwnedCodeModeSessionProvider {
             .process_host
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(process_host) = process_host.as_ref()
-            && process_host.is_alive()
-        {
+        if let Some(process_host) = process_host.as_ref() {
             return Arc::clone(process_host);
         }
 
