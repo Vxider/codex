@@ -1975,6 +1975,7 @@ dependencies = [
  "codex-chatgpt",
  "codex-cloud-config",
  "codex-config",
+ "codex-connectors",
  "codex-core",
  "codex-core-plugins",
  "codex-exec-server",
@@ -2292,7 +2293,6 @@ version = "0.0.0"
 dependencies = [
  "anyhow",
  "clap",
- "codex-app-server-protocol",
  "codex-connectors",
  "codex-core",
  "codex-git-utils",
@@ -2582,7 +2582,6 @@ name = "codex-connectors"
 version = "0.0.0"
 dependencies = [
  "anyhow",
- "codex-app-server-protocol",
  "codex-config",
  "pretty_assertions",
  "serde",
@@ -4010,6 +4009,7 @@ version = "0.0.0"
 dependencies = [
  "codex-app-server-protocol",
  "codex-code-mode",
+ "codex-connectors",
  "codex-features",
  "codex-file-system",
  "codex-protocol",
