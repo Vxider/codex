@@ -47,6 +47,15 @@ fn qualified_mcp_tool_name_prefix_sanitizes_server_names_without_lowercasing() {
 }
 
 #[test]
+fn codex_apps_server_names_include_cloud_agent_alias() {
+    assert!(is_codex_apps_mcp_server_name(CODEX_APPS_MCP_SERVER_NAME));
+    assert!(is_codex_apps_mcp_server_name(
+        CODEX_CLOUD_AGENT_APPS_MCP_SERVER_NAME
+    ));
+    assert!(!is_codex_apps_mcp_server_name("custom"));
+}
+
+#[test]
 fn mcp_prompt_auto_approval_honors_unrestricted_managed_profiles() {
     assert!(mcp_permission_prompt_is_auto_approved(
         AskForApproval::Never,

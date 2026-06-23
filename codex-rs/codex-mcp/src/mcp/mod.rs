@@ -46,9 +46,18 @@ use crate::runtime::McpRuntimeContext;
 use crate::server::EffectiveMcpServer;
 
 pub const CODEX_APPS_MCP_SERVER_NAME: &str = "codex_apps";
+pub const CODEX_CLOUD_AGENT_APPS_MCP_SERVER_NAME: &str = "codex-connectors-mcp";
 const MCP_TOOL_NAME_PREFIX: &str = "mcp";
 const MCP_TOOL_NAME_DELIMITER: &str = "__";
 const CODEX_CONNECTORS_TOKEN_ENV_VAR: &str = "CODEX_CONNECTORS_TOKEN";
+
+/// Returns whether an MCP server name is reserved for first-party Codex Apps.
+pub fn is_codex_apps_mcp_server_name(server_name: &str) -> bool {
+    matches!(
+        server_name,
+        CODEX_APPS_MCP_SERVER_NAME | CODEX_CLOUD_AGENT_APPS_MCP_SERVER_NAME
+    )
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum McpSnapshotDetail {

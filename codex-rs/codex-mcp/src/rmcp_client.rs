@@ -27,8 +27,8 @@ use crate::codex_apps::normalize_codex_apps_callable_namespace;
 use crate::codex_apps::normalize_codex_apps_tool_title;
 use crate::codex_apps::write_codex_apps_tools_cache;
 use crate::elicitation::ElicitationRequestManager;
-use crate::mcp::CODEX_APPS_MCP_SERVER_NAME;
 use crate::mcp::ToolPluginProvenance;
+use crate::mcp::is_codex_apps_mcp_server_name;
 use crate::runtime::McpRuntimeContext;
 use crate::runtime::emit_duration;
 use crate::server::EffectiveMcpServer;
@@ -157,7 +157,7 @@ impl AsyncManagedClient {
         client_elicitation_capability: ElicitationCapability,
         supports_openai_form_elicitation: bool,
     ) -> Self {
-        let is_codex_apps_mcp_server = server_name == CODEX_APPS_MCP_SERVER_NAME;
+        let is_codex_apps_mcp_server = is_codex_apps_mcp_server_name(&server_name);
         let tool_filter = server
             .configured_config()
             .map(ToolFilter::from_config)
@@ -748,6 +748,7 @@ async fn make_rmcp_client(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mcp::CODEX_APPS_MCP_SERVER_NAME;
     use pretty_assertions::assert_eq;
     use rmcp::model::JsonObject;
     use rmcp::model::Meta;

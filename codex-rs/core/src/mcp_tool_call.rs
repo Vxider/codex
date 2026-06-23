@@ -45,6 +45,7 @@ use codex_mcp::SandboxState;
 use codex_mcp::auth_elicitation_completed_result;
 use codex_mcp::build_auth_elicitation_plan;
 use codex_mcp::declared_openai_file_input_param_names;
+use codex_mcp::is_codex_apps_mcp_server_name;
 use codex_mcp::mcp_permission_prompt_is_auto_approved;
 use codex_otel::sanitize_metric_tag_value;
 use codex_protocol::items::McpToolCallError;
@@ -1544,7 +1545,7 @@ fn openai_file_input_params_for_server(
     server: &str,
     meta: Option<&serde_json::Map<String, serde_json::Value>>,
 ) -> Option<Vec<String>> {
-    (server == CODEX_APPS_MCP_SERVER_NAME)
+    is_codex_apps_mcp_server_name(server)
         .then_some(declared_openai_file_input_param_names(meta))
         .filter(|params| !params.is_empty())
 }
