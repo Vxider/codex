@@ -10,6 +10,8 @@
 //! - `rules.prefix_rules` append high-priority rules first.
 //! - `hooks` append high-priority event groups first while failing closed on
 //!   active managed-dir conflicts.
+//! - Higher-priority layers replace each named MCP server requirement as an
+//!   atomic value.
 //! - `permissions.filesystem.deny_read` is a high-priority-first union across
 //!   layers.
 
@@ -151,6 +153,7 @@ impl RequirementsLayerStack {
         let mut merged_toml = TomlValue::Table(toml::map::Map::new());
         for layer in &layers {
             merge_toml_values(&mut merged_toml, &layer.regular_toml);
+            replace_mcp_server_requirements(&mut merged_toml, &layer.regular_toml);
         }
 
         let requirements: ConfigRequirementsToml =
@@ -185,6 +188,46 @@ impl RequirementsLayerStack {
         let output_is_empty = output.clone().into_toml().is_empty();
         Ok((!output_is_empty).then_some(output))
     }
+}
+
+fn replace_mcp_server_requirements(base: &mut TomlValue, overlay: &TomlValue) {
+    replace_named_requirements_at_path(base, overlay, &["mcp_servers"]);
+
+    let Some(plugins) = table_at_path(overlay, &["plugins"]) else {
+        return;
+    };
+    for plugin_name in plugins.keys() {
+        replace_named_requirements_at_path(base, overlay, &["plugins", plugin_name, "mcp_servers"]);
+    }
+}
+
+fn replace_named_requirements_at_path(base: &mut TomlValue, overlay: &TomlValue, path: &[&str]) {
+    let Some(overlay_requirements) = table_at_path(overlay, path) else {
+        return;
+    };
+    let Some(base_requirements) = table_at_path_mut(base, path) else {
+        return;
+    };
+    for (name, requirement) in overlay_requirements {
+        base_requirements.insert(name.clone(), requirement.clone());
+    }
+}
+
+fn table_at_path<'a>(mut value: &'a TomlValue, path: &[&str]) -> Option<&'a toml::Table> {
+    for key in path {
+        value = value.as_table()?.get(*key)?;
+    }
+    value.as_table()
+}
+
+fn table_at_path_mut<'a>(
+    mut value: &'a mut TomlValue,
+    path: &[&str],
+) -> Option<&'a mut toml::Table> {
+    for key in path {
+        value = value.as_table_mut()?.get_mut(*key)?;
+    }
+    value.as_table_mut()
 }
 
 fn populate_merged_regular_fields_with_sources(
