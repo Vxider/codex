@@ -28,21 +28,22 @@ pub(super) enum ExecutorPluginMcpProviderError {
         #[source]
         source: io::Error,
     },
+    #[error(
+        "failed to resolve MCP config path `{relative_path}` below selected plugin `{plugin_id}` at `{root}`: {source}"
+    )]
+    InvalidConfigPath {
+        plugin_id: String,
+        root: PathUri,
+        relative_path: &'static str,
+        #[source]
+        source: PathUriParseError,
+    },
     #[error("failed to parse MCP config for selected plugin `{plugin_id}` at `{path}`: {source}")]
     ParseConfig {
         plugin_id: String,
         path: PathUri,
         #[source]
         source: serde_json::Error,
-    },
-    #[error(
-        "failed to resolve MCP config path for selected plugin `{plugin_id}` at `{root}`: {source}"
-    )]
-    ResolveConfigPath {
-        plugin_id: String,
-        root: PathUri,
-        #[source]
-        source: PathUriParseError,
     },
 }
 
@@ -81,22 +82,17 @@ async fn load_from_file_system(
                 path.clone(),
             )
         }
-        Some(PluginManifestMcpServers::Object(object_config)) => (
-            object_config.clone(),
-            plugin_root
-                .join(".codex-plugin/plugin.json")
-                .map_err(|source| ExecutorPluginMcpProviderError::ResolveConfigPath {
-                    plugin_id: plugin_id.to_string(),
-                    root: plugin_root.clone(),
-                    source,
-                })?,
-        ),
+        Some(PluginManifestMcpServers::Object(object_config)) => {
+            let PluginResourceLocator::Environment { path, .. } = plugin.manifest_path();
+            (object_config.clone(), path.clone())
+        }
         None => {
             let config_path = plugin_root
                 .join(DEFAULT_MCP_CONFIG_FILE)
-                .map_err(|source| ExecutorPluginMcpProviderError::ResolveConfigPath {
+                .map_err(|source| ExecutorPluginMcpProviderError::InvalidConfigPath {
                     plugin_id: plugin_id.to_string(),
                     root: plugin_root.clone(),
+                    relative_path: DEFAULT_MCP_CONFIG_FILE,
                     source,
                 })?;
             let contents = match file_system
