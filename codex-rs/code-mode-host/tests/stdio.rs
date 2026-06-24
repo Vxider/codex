@@ -556,6 +556,80 @@ setTimeout(() => { text("should never emit"); }, 60000);
 
 #[cfg(unix)]
 #[tokio::test]
+async fn closed_host_stdout_terminates_the_spawned_process() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let pid_log = temp_dir.path().join("host-pids");
+    let wrapper = temp_dir.path().join("stdout-closing-host");
+    let payload = serde_json::to_vec(&HostToClient::HostHello(HostHello::new(
+        ProtocolVersion::V1,
+        CapabilitySet::empty(),
+    )))
+    .expect("serialize host hello");
+    let mut frame = (payload.len() as u32).to_le_bytes().to_vec();
+    frame.extend(payload);
+    let escaped_frame = frame
+        .iter()
+        .map(|byte| format!("\\{byte:03o}"))
+        .collect::<String>();
+    let script = format!(
+        "#!/bin/sh\nprintf '%s\\n' \"$$\" >> {}\nprintf '%b' '{escaped_frame}'\nexec 1>&-\nwhile :; do :; done\n",
+        shell_quote(&pid_log),
+    );
+    std::fs::write(&wrapper, script).expect("write host wrapper");
+    let mut permissions = std::fs::metadata(&wrapper)
+        .expect("host wrapper metadata")
+        .permissions();
+    permissions.set_mode(/*mode*/ 0o755);
+    std::fs::set_permissions(&wrapper, permissions).expect("make host wrapper executable");
+
+    let provider = ProcessOwnedCodeModeSessionProvider::with_host_program(wrapper);
+    let session_result = tokio::time::timeout(
+        Duration::from_secs(5),
+        provider.create_session(Arc::new(RecordingDelegate::default())),
+    )
+    .await;
+    let pid = recorded_pids(&pid_log)[0];
+    let error = match session_result {
+        Ok(result) => result
+            .err()
+            .expect("closed stdout should fail session creation"),
+        Err(error) => {
+            // SAFETY: `pid` was written by the wrapper process owned by this test.
+            let _ = unsafe { libc::kill(pid, libc::SIGKILL) };
+            panic!("session creation timeout: {error}");
+        }
+    };
+    assert!(
+        error.contains("closed its stdout"),
+        "unexpected error: {error}"
+    );
+
+    let exited = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            // SAFETY: signal zero only checks whether the process recorded by
+            // this test still exists.
+            if unsafe {
+                libc::kill(pid, /*sig*/ 0)
+            } == -1
+                && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    if let Err(error) = exited {
+        // SAFETY: `pid` was written by the wrapper process owned by this test.
+        let _ = unsafe { libc::kill(pid, libc::SIGKILL) };
+        panic!("host process was not terminated: {error}");
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn crashed_host_fails_in_flight_exec_and_next_exec_respawns() {
     use std::os::unix::fs::PermissionsExt;
 
