@@ -192,13 +192,19 @@ impl ProcessOwnedCodeModeSession {
     }
 
     fn current_connection(&self) -> Result<Option<Arc<Connection>>, String> {
-        match &*self
+        let mut state = self
             .state
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-        {
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match &*state {
             SessionState::New => Ok(None),
-            SessionState::Open(connection) => Ok(Some(Arc::clone(connection))),
+            SessionState::Open(connection) if connection.is_alive() => {
+                Ok(Some(Arc::clone(connection)))
+            }
+            SessionState::Open(_) => {
+                *state = SessionState::New;
+                Ok(None)
+            }
             SessionState::Shutdown => Err("code mode session is shutting down".to_string()),
         }
     }
