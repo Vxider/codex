@@ -556,6 +556,79 @@ setTimeout(() => { text("should never emit"); }, 60000);
 
 #[cfg(unix)]
 #[tokio::test]
+async fn concurrent_sessions_from_one_provider_share_one_host_process() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let host_binary =
+        codex_utils_cargo_bin::cargo_bin("codex-code-mode-host").expect("host binary");
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let pid_log = temp_dir.path().join("host-pids");
+    let wrapper = temp_dir.path().join("code-mode-host-wrapper");
+    let script = format!(
+        "#!/bin/sh\nprintf '%s\\n' \"$$\" >> {}\nexec {}\n",
+        shell_quote(&pid_log),
+        shell_quote(&host_binary),
+    );
+    std::fs::write(&wrapper, script).expect("write host wrapper");
+    let mut permissions = std::fs::metadata(&wrapper)
+        .expect("host wrapper metadata")
+        .permissions();
+    permissions.set_mode(/*mode*/ 0o755);
+    std::fs::set_permissions(&wrapper, permissions).expect("make host wrapper executable");
+
+    let provider = ProcessOwnedCodeModeSessionProvider::with_host_program(wrapper);
+    let (first, second, third) = tokio::join!(
+        provider.create_session(Arc::new(RecordingDelegate::default())),
+        provider.create_session(Arc::new(RecordingDelegate::default())),
+        provider.create_session(Arc::new(RecordingDelegate::default())),
+    );
+    let first = first.expect("create first session");
+    let second = second.expect("create second session");
+    let third = third.expect("create third session");
+
+    let (first_response, second_response, third_response) = tokio::join!(
+        execute(&first, execute_request(r#"text("first");"#)),
+        execute(&second, execute_request(r#"text("second");"#)),
+        execute(&third, execute_request(r#"text("third");"#)),
+    );
+    assert_eq!(
+        (first_response, second_response, third_response),
+        (
+            RuntimeResponse::Result {
+                cell_id: cell_id("1"),
+                content_items: vec![FunctionCallOutputContentItem::InputText {
+                    text: "first".to_string(),
+                }],
+                error_text: None,
+            },
+            RuntimeResponse::Result {
+                cell_id: cell_id("1"),
+                content_items: vec![FunctionCallOutputContentItem::InputText {
+                    text: "second".to_string(),
+                }],
+                error_text: None,
+            },
+            RuntimeResponse::Result {
+                cell_id: cell_id("1"),
+                content_items: vec![FunctionCallOutputContentItem::InputText {
+                    text: "third".to_string(),
+                }],
+                error_text: None,
+            },
+        )
+    );
+    assert_eq!(recorded_pids(&pid_log).len(), 1);
+
+    let (first_shutdown, second_shutdown, third_shutdown) =
+        tokio::join!(first.shutdown(), second.shutdown(), third.shutdown(),);
+    assert_eq!(
+        (first_shutdown, second_shutdown, third_shutdown),
+        (Ok(()), Ok(()), Ok(()))
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn closed_host_stdout_terminates_the_spawned_process() {
     use std::os::unix::fs::PermissionsExt;
 

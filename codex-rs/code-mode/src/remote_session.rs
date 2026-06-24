@@ -25,6 +25,9 @@ mod connection;
 const CODE_MODE_HOST_PATH_ENV: &str = "CODEX_CODE_MODE_HOST_PATH";
 
 /// Creates code-mode sessions backed by one lazily spawned process host.
+///
+/// All sessions created by one provider share that host. Callers that want one
+/// sidecar across multiple Codex threads must share the provider instance.
 pub struct ProcessOwnedCodeModeSessionProvider {
     host_program: PathBuf,
     process_host: StdMutex<Option<Arc<OwnedProcessHost>>>,
@@ -146,12 +149,8 @@ pub struct ProcessOwnedCodeModeSession {
 
 impl ProcessOwnedCodeModeSession {
     pub fn new() -> Self {
-        Self::with_delegate(Arc::new(NoopCodeModeSessionDelegate))
-    }
-
-    pub fn with_delegate(delegate: Arc<dyn CodeModeSessionDelegate>) -> Self {
         Self::with_process_host(
-            delegate,
+            Arc::new(NoopCodeModeSessionDelegate),
             Arc::new(OwnedProcessHost::new(default_host_program())),
         )
     }
