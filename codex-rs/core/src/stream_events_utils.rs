@@ -485,16 +485,9 @@ pub(crate) async fn handle_output_item_done(
         }
         // The tool request should be answered directly (or was denied); push that response into the transcript.
         Err(FunctionCallError::RespondToModel(message)) => {
-            let response = ResponseInputItem::FunctionCallOutput {
-                call_id: String::new(),
-                output: FunctionCallOutputPayload {
-                    body: FunctionCallOutputBody::Text(message),
-                    ..Default::default()
-                },
-            };
             record_completed_response_item(ctx.sess.as_ref(), ctx.turn_context.as_ref(), &item)
                 .await;
-            if let Some(response_item) = response_input_to_response_item(&response) {
+            if let Some(response_item) = failed_tool_output_for_item(&item, message) {
                 ctx.sess
                     .record_conversation_items(
                         &ctx.turn_context,
@@ -512,6 +505,39 @@ pub(crate) async fn handle_output_item_done(
     }
 
     Ok(output)
+}
+
+fn failed_tool_output_for_item(item: &ResponseItem, message: String) -> Option<ResponseItem> {
+    let output = FunctionCallOutputPayload {
+        body: FunctionCallOutputBody::Text(message),
+        success: Some(false),
+    };
+
+    match item {
+        ResponseItem::FunctionCall { call_id, .. } => Some(ResponseItem::FunctionCallOutput {
+            id: None,
+            call_id: call_id.clone(),
+            output,
+            internal_chat_message_metadata_passthrough: None,
+        }),
+        ResponseItem::ToolSearchCall {
+            call_id: Some(call_id),
+            ..
+        } => Some(ResponseItem::FunctionCallOutput {
+            id: None,
+            call_id: call_id.clone(),
+            output,
+            internal_chat_message_metadata_passthrough: None,
+        }),
+        ResponseItem::CustomToolCall { call_id, .. } => Some(ResponseItem::CustomToolCallOutput {
+            id: None,
+            call_id: call_id.clone(),
+            name: None,
+            output,
+            internal_chat_message_metadata_passthrough: None,
+        }),
+        _ => None,
+    }
 }
 
 pub(crate) async fn handle_non_tool_response_item(
@@ -617,53 +643,6 @@ fn completed_item_defers_mailbox_delivery_to_next_turn(
         }
         ResponseItem::ImageGenerationCall { .. } => true,
         _ => false,
-    }
-}
-
-pub(crate) fn response_input_to_response_item(input: &ResponseInputItem) -> Option<ResponseItem> {
-    match input {
-        ResponseInputItem::FunctionCallOutput { call_id, output } => {
-            Some(ResponseItem::FunctionCallOutput {
-                id: None,
-                call_id: call_id.clone(),
-                output: output.clone(),
-                internal_chat_message_metadata_passthrough: None,
-            })
-        }
-        ResponseInputItem::CustomToolCallOutput {
-            call_id,
-            name,
-            output,
-        } => Some(ResponseItem::CustomToolCallOutput {
-            id: None,
-            call_id: call_id.clone(),
-            name: name.clone(),
-            output: output.clone(),
-            internal_chat_message_metadata_passthrough: None,
-        }),
-        ResponseInputItem::McpToolCallOutput { call_id, output } => {
-            let output = output.as_function_call_output_payload();
-            Some(ResponseItem::FunctionCallOutput {
-                id: None,
-                call_id: call_id.clone(),
-                output,
-                internal_chat_message_metadata_passthrough: None,
-            })
-        }
-        ResponseInputItem::ToolSearchOutput {
-            call_id,
-            status,
-            execution,
-            tools,
-        } => Some(ResponseItem::ToolSearchOutput {
-            id: None,
-            call_id: Some(call_id.clone()),
-            status: status.clone(),
-            execution: execution.clone(),
-            tools: tools.clone(),
-            internal_chat_message_metadata_passthrough: None,
-        }),
-        _ => None,
     }
 }
 

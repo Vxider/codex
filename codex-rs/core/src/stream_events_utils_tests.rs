@@ -20,6 +20,7 @@ use codex_protocol::items::AgentMessageContent;
 use codex_protocol::items::TurnItem;
 use codex_protocol::memory_citation::MemoryCitation;
 use codex_protocol::models::ContentItem;
+use codex_protocol::models::FunctionCallOutputBody;
 use codex_protocol::models::FunctionCallOutputPayload;
 use codex_protocol::models::LocalShellAction;
 use codex_protocol::models::LocalShellExecAction;
@@ -311,6 +312,84 @@ async fn handle_output_item_done_returns_contributed_last_agent_message() {
         output.last_agent_message.as_deref(),
         Some("contributed assistant text")
     );
+}
+
+#[tokio::test]
+async fn handle_output_item_done_records_failed_tool_output_with_matching_call_id() {
+    let (session, turn_context) = make_session_and_context().await;
+    let session = Arc::new(session);
+    let turn_context = Arc::new(turn_context);
+    let step_context = StepContext::for_test(Arc::clone(&turn_context));
+    let router = Arc::new(ToolRouter::from_context(
+        step_context.as_ref(),
+        crate::tools::router::ToolRouterParams {
+            tool_suggest_candidates: None,
+            mcp_tools: None,
+            deferred_mcp_tools: None,
+            extension_tool_executors: Vec::new(),
+            dynamic_tools: turn_context.dynamic_tools.as_slice(),
+        },
+        &Default::default(),
+    ));
+    let tracker = Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new()));
+    let tool_runtime = ToolCallRuntime::new(
+        router,
+        Arc::clone(&session),
+        Arc::clone(&step_context),
+        tracker,
+    );
+    let mut ctx = HandleOutputCtx {
+        sess: Arc::clone(&session),
+        turn_context: Arc::clone(&turn_context),
+        turn_store: Arc::new(ExtensionData::new(turn_context.sub_id.clone())),
+        tool_runtime,
+        cancellation_token: CancellationToken::new(),
+    };
+
+    let item = ResponseItem::ToolSearchCall {
+        id: None,
+        call_id: Some("search-call".to_string()),
+        status: Some("completed".to_string()),
+        execution: "client".to_string(),
+        arguments: serde_json::json!({"query": 42}),
+        internal_chat_message_metadata_passthrough: None,
+    };
+
+    let output = handle_output_item_done(&mut ctx, item, /*previously_active_item*/ None)
+        .await
+        .expect("tool parse failure should be returned to the model");
+
+    assert!(output.needs_follow_up);
+    let history = session.clone_history().await;
+    let raw_items = history.raw_items();
+    assert!(matches!(
+        &raw_items[0],
+        ResponseItem::ToolSearchCall {
+            call_id: Some(call_id),
+            ..
+        } if call_id == "search-call"
+    ));
+    assert!(matches!(
+        &raw_items[1],
+        ResponseItem::FunctionCallOutput {
+            call_id,
+            ..
+        } if call_id == "search-call"
+    ));
+
+    // Verify the output contains the parse error message and success=false
+    match &raw_items[1] {
+        ResponseItem::FunctionCallOutput { call_id, output, .. } => {
+            assert_eq!(call_id, "search-call");
+            assert_eq!(output.success, Some(false));
+            if let FunctionCallOutputBody::Text(text) = &output.body {
+                assert!(text.contains("failed to parse tool_search arguments"));
+            } else {
+                panic!("expected text output body");
+            }
+        }
+        _ => panic!("expected FunctionCallOutput for parse failure"),
+    }
 }
 
 #[tokio::test]
