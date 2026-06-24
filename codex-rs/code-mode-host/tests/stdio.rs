@@ -31,6 +31,7 @@ use codex_code_mode::host::HostHello;
 use codex_code_mode::host::HostRequest;
 use codex_code_mode::host::HostResponse;
 use codex_code_mode::host::HostToClient;
+use codex_code_mode::host::MAX_FRAME_BYTES;
 use codex_code_mode::host::ProtocolVersion;
 use codex_code_mode::host::SessionId;
 use codex_code_mode::host::SupportedProtocolVersions;
@@ -207,6 +208,66 @@ text(result.value);
         *delegate.closed_cells.lock().expect("closed cells lock"),
         vec![cell_id("1"), cell_id("2"), cell_id("3")]
     );
+}
+
+#[tokio::test]
+async fn oversized_output_errors_the_cell_without_wedging_the_host() {
+    let provider = ProcessOwnedCodeModeSessionProvider::with_host_program(
+        codex_utils_cargo_bin::cargo_bin("codex-code-mode-host").expect("host binary"),
+    );
+    let session = provider
+        .create_session(Arc::new(RecordingDelegate::default()))
+        .await
+        .expect("create remote session");
+
+    let accepted_output_bytes = 9 * 1024 * 1024;
+    let accepted = execute(
+        &session,
+        execute_request(&format!(r#"text("x".repeat({accepted_output_bytes}));"#)),
+    )
+    .await;
+    let RuntimeResponse::Result {
+        cell_id: accepted_cell_id,
+        content_items,
+        error_text,
+    } = accepted
+    else {
+        panic!("expected accepted output to complete");
+    };
+    assert_eq!(accepted_cell_id, cell_id("1"));
+    assert_eq!(error_text, None);
+    let [FunctionCallOutputContentItem::InputText { text }] = content_items.as_slice() else {
+        panic!("expected one text output item");
+    };
+    assert_eq!(text.len(), accepted_output_bytes);
+
+    let oversized_output_bytes = MAX_FRAME_BYTES + 1024;
+    let started = session
+        .execute(execute_request(&format!(
+            r#"text("x".repeat({oversized_output_bytes}));"#
+        )))
+        .await
+        .expect("start oversized output");
+    let error = tokio::time::timeout(Duration::from_secs(15), started.initial_response())
+        .await
+        .expect("oversized response timeout")
+        .expect_err("oversized response should error the cell");
+    assert!(
+        error.contains(&format!("{MAX_FRAME_BYTES}-byte IPC frame limit")),
+        "unexpected error: {error}"
+    );
+
+    assert_eq!(
+        execute(&session, execute_request(r#"text("recovered");"#)).await,
+        RuntimeResponse::Result {
+            cell_id: cell_id("3"),
+            content_items: vec![FunctionCallOutputContentItem::InputText {
+                text: "recovered".to_string(),
+            }],
+            error_text: None,
+        }
+    );
+    session.shutdown().await.expect("shutdown remote session");
 }
 
 #[tokio::test]
