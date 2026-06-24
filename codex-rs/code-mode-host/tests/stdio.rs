@@ -1,101 +1,192 @@
-use std::io::Cursor;
-use std::io::Read;
-use std::io::Write;
-use std::mem::size_of;
-use std::process::Command;
-use std::process::Stdio;
+#![allow(clippy::expect_used)]
 
-use codex_code_mode_protocol::host::CapabilitySet;
-use codex_code_mode_protocol::host::ClientHello;
-use codex_code_mode_protocol::host::ClientToHost;
-use codex_code_mode_protocol::host::HostHello;
-use codex_code_mode_protocol::host::HostToClient;
-use codex_code_mode_protocol::host::ProtocolVersion;
-use codex_code_mode_protocol::host::SessionId;
-use codex_code_mode_protocol::host::SupportedProtocolVersions;
+use std::sync::Arc;
+use std::sync::Mutex;
+
+use codex_code_mode::CellId;
+use codex_code_mode::CodeModeNestedToolCall;
+use codex_code_mode::CodeModeSession;
+use codex_code_mode::CodeModeSessionDelegate;
+use codex_code_mode::CodeModeSessionProvider;
+use codex_code_mode::CodeModeToolKind;
+use codex_code_mode::ExecuteRequest;
+use codex_code_mode::FunctionCallOutputContentItem;
+use codex_code_mode::NotificationFuture;
+use codex_code_mode::ProcessOwnedCodeModeSessionProvider;
+use codex_code_mode::RuntimeResponse;
+use codex_code_mode::ToolDefinition;
+use codex_code_mode::ToolInvocationFuture;
+use codex_code_mode::WaitOutcome;
+use codex_code_mode::WaitRequest;
+use codex_protocol::ToolName;
 use pretty_assertions::assert_eq;
+use serde_json::json;
+use tokio_util::sync::CancellationToken;
 
-fn encode_frame(message: &ClientToHost) -> anyhow::Result<Vec<u8>> {
-    let payload = serde_json::to_vec(message)?;
-    let mut frame = (payload.len() as u32).to_le_bytes().to_vec();
-    frame.extend(payload);
-    Ok(frame)
+#[derive(Default)]
+struct RecordingDelegate {
+    invocations: Mutex<Vec<CodeModeNestedToolCall>>,
+    notifications: Mutex<Vec<(String, CellId, String)>>,
+    closed_cells: Mutex<Vec<CellId>>,
 }
 
-fn decode_frame(cursor: &mut Cursor<Vec<u8>>) -> anyhow::Result<Option<HostToClient>> {
-    let mut length = [0_u8; size_of::<u32>()];
-    match cursor.read_exact(&mut length) {
-        Ok(()) => {}
-        Err(err) if err.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
-        Err(err) => return Err(err.into()),
+impl CodeModeSessionDelegate for RecordingDelegate {
+    fn invoke_tool<'a>(
+        &'a self,
+        invocation: CodeModeNestedToolCall,
+        _cancellation_token: CancellationToken,
+    ) -> ToolInvocationFuture<'a> {
+        self.invocations
+            .lock()
+            .expect("invocations lock")
+            .push(invocation);
+        Box::pin(async { Ok(json!({ "value": "output" })) })
     }
-    let mut payload = vec![0; u32::from_le_bytes(length) as usize];
-    cursor.read_exact(&mut payload)?;
-    Ok(Some(serde_json::from_slice(&payload)?))
+
+    fn notify<'a>(
+        &'a self,
+        call_id: String,
+        cell_id: CellId,
+        text: String,
+        _cancellation_token: CancellationToken,
+    ) -> NotificationFuture<'a> {
+        self.notifications
+            .lock()
+            .expect("notifications lock")
+            .push((call_id, cell_id, text));
+        Box::pin(async { Ok(()) })
+    }
+
+    fn cell_closed(&self, cell_id: &CellId) {
+        self.closed_cells
+            .lock()
+            .expect("closed cells lock")
+            .push(cell_id.clone());
+    }
 }
 
-#[test]
-fn binary_serves_protocol_over_stdin_and_stdout() -> anyhow::Result<()> {
-    let host_binary =
-        codex_utils_cargo_bin::cargo_bin("codex-code-mode-host").expect("host binary");
-    let mut child = Command::new(host_binary)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn host");
-    let session_id = SessionId::new("session-1").expect("session ID");
-    let messages = [
-        ClientToHost::ClientHello(
-            ClientHello::new(
-                SupportedProtocolVersions::try_new([ProtocolVersion::V1])
-                    .expect("supported versions"),
-                CapabilitySet::empty(),
-                CapabilitySet::empty(),
-            )
-            .expect("client hello"),
-        ),
-        ClientToHost::OpenSession {
-            session_id: session_id.clone(),
-        },
-        ClientToHost::CloseSession {
-            session_id: session_id.clone(),
-        },
-    ];
-    let mut stdin = child.stdin.take().expect("child stdin");
-    for message in messages {
-        stdin
-            .write_all(&encode_frame(&message).expect("encode frame"))
-            .expect("write frame");
+fn cell_id(value: &str) -> CellId {
+    CellId::new(value.to_string())
+}
+
+fn execute_request(source: &str) -> ExecuteRequest {
+    ExecuteRequest {
+        tool_call_id: "call-1".to_string(),
+        enabled_tools: Vec::new(),
+        source: source.to_string(),
+        yield_time_ms: None,
+        max_output_tokens: None,
     }
-    drop(stdin);
+}
 
-    let output = child.wait_with_output().expect("wait for host");
-    assert!(
-        output.status.success(),
-        "host failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert_eq!(output.stderr, Vec::<u8>::new());
+async fn execute(session: &Arc<dyn CodeModeSession>, request: ExecuteRequest) -> RuntimeResponse {
+    session
+        .execute(request)
+        .await
+        .expect("start execution")
+        .initial_response()
+        .await
+        .expect("initial response")
+}
 
-    let mut stdout = Cursor::new(output.stdout);
+#[tokio::test]
+async fn remote_session_persists_values_forwards_delegates_and_controls_cells() {
+    let provider = ProcessOwnedCodeModeSessionProvider::with_host_program(
+        codex_utils_cargo_bin::cargo_bin("codex-code-mode-host").expect("host binary"),
+    );
+    let delegate = Arc::new(RecordingDelegate::default());
+    let session = provider
+        .create_session(delegate.clone())
+        .await
+        .expect("create remote session");
+
     assert_eq!(
-        decode_frame(&mut stdout)?,
-        Some(HostToClient::HostHello(HostHello::new(
-            ProtocolVersion::V1,
-            CapabilitySet::empty(),
-        )))
+        execute(&session, execute_request(r#"store("key", "persisted");"#),).await,
+        RuntimeResponse::Result {
+            cell_id: cell_id("1"),
+            content_items: Vec::new(),
+            error_text: None,
+        }
+    );
+
+    let mut callback_request = execute_request(
+        r#"
+const result = await tools.echo({ value: String(load("key")) });
+notify("notice");
+text(result.value);
+"#,
+    );
+    callback_request.tool_call_id = "call-2".to_string();
+    callback_request.enabled_tools = vec![ToolDefinition {
+        name: "echo".to_string(),
+        tool_name: ToolName::plain("echo"),
+        description: String::new(),
+        kind: CodeModeToolKind::Function,
+        input_schema: None,
+        output_schema: None,
+    }];
+    assert_eq!(
+        execute(&session, callback_request).await,
+        RuntimeResponse::Result {
+            cell_id: cell_id("2"),
+            content_items: vec![FunctionCallOutputContentItem::InputText {
+                text: "output".to_string(),
+            }],
+            error_text: None,
+        }
     );
     assert_eq!(
-        decode_frame(&mut stdout)?,
-        Some(HostToClient::SessionReady {
-            session_id: session_id.clone(),
+        *delegate.invocations.lock().expect("invocations lock"),
+        vec![CodeModeNestedToolCall {
+            cell_id: cell_id("2"),
+            runtime_tool_call_id: "tool-1".to_string(),
+            tool_name: ToolName::plain("echo"),
+            tool_kind: CodeModeToolKind::Function,
+            input: Some(json!({ "value": "persisted" })),
+        }]
+    );
+    assert_eq!(
+        *delegate.notifications.lock().expect("notifications lock"),
+        vec![("call-2".to_string(), cell_id("2"), "notice".to_string())]
+    );
+
+    let mut pending_request = execute_request("await new Promise(() => {});");
+    pending_request.tool_call_id = "call-3".to_string();
+    pending_request.yield_time_ms = Some(1);
+    assert_eq!(
+        execute(&session, pending_request).await,
+        RuntimeResponse::Yielded {
+            cell_id: cell_id("3"),
+            content_items: Vec::new(),
+        }
+    );
+    assert_eq!(
+        session
+            .wait(WaitRequest {
+                cell_id: cell_id("3"),
+                yield_time_ms: 1,
+            })
+            .await
+            .expect("wait for cell"),
+        WaitOutcome::LiveCell(RuntimeResponse::Yielded {
+            cell_id: cell_id("3"),
+            content_items: Vec::new(),
         })
     );
     assert_eq!(
-        decode_frame(&mut stdout)?,
-        Some(HostToClient::SessionClosed { session_id })
+        session
+            .terminate(cell_id("3"))
+            .await
+            .expect("terminate cell"),
+        WaitOutcome::LiveCell(RuntimeResponse::Terminated {
+            cell_id: cell_id("3"),
+            content_items: Vec::new(),
+        })
     );
-    assert_eq!(decode_frame(&mut stdout)?, None);
-    Ok(())
+
+    session.shutdown().await.expect("shutdown remote session");
+    assert_eq!(
+        *delegate.closed_cells.lock().expect("closed cells lock"),
+        vec![cell_id("1"), cell_id("2"), cell_id("3")]
+    );
 }

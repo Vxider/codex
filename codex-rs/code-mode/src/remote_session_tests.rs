@@ -1,8 +1,6 @@
 use std::sync::Arc;
 
-use codex_code_mode_protocol::CodeModeSession;
 use codex_code_mode_protocol::CodeModeSessionProvider;
-use pretty_assertions::assert_eq;
 
 use super::ProcessOwnedCodeModeSession;
 use super::ProcessOwnedCodeModeSessionProvider;
@@ -19,30 +17,36 @@ fn provider_reuses_its_live_process_host() {
 }
 
 #[tokio::test]
-async fn provider_allocates_distinct_logical_sessions() {
-    let provider = ProcessOwnedCodeModeSessionProvider::default();
+async fn provider_reports_host_spawn_failure() {
+    let provider = ProcessOwnedCodeModeSessionProvider::with_host_program(
+        "codex-code-mode-host-does-not-exist".into(),
+    );
 
-    let first = provider
+    let error = provider
         .create_session(Arc::new(NoopCodeModeSessionDelegate))
         .await
-        .expect("first session");
-    let second = provider
-        .create_session(Arc::new(NoopCodeModeSessionDelegate))
-        .await
-        .expect("second session");
+        .err()
+        .expect("session creation should fail");
 
-    assert!(first.is_alive());
-    assert!(second.is_alive());
-    assert!(!Arc::ptr_eq(&first, &second));
+    assert!(error.contains("failed to spawn code-mode host"));
 }
 
 #[tokio::test]
-async fn shutdown_only_closes_the_logical_session() {
-    let first = ProcessOwnedCodeModeSession::new();
-    let second = ProcessOwnedCodeModeSession::new();
+async fn shutdown_before_open_does_not_spawn_the_host() {
+    let session = ProcessOwnedCodeModeSession::new();
 
-    first.shutdown().await.expect("shutdown session");
+    session.shutdown().await.expect("shutdown session");
+    let error = session
+        .execute(codex_code_mode_protocol::ExecuteRequest {
+            tool_call_id: "call-1".to_string(),
+            enabled_tools: Vec::new(),
+            source: "text('unreachable')".to_string(),
+            yield_time_ms: None,
+            max_output_tokens: None,
+        })
+        .await
+        .err()
+        .expect("shutdown session should reject execution");
 
-    assert_eq!(first.is_alive(), false);
-    assert_eq!(second.is_alive(), true);
+    assert_eq!(error, "code mode session is shutting down");
 }

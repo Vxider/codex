@@ -1,9 +1,9 @@
-//! Messages and local IPC framing for the callback-only code-mode host boundary.
+//! Messages and local IPC framing for the code-mode host boundary.
 //!
-//! Protocol version 1 relies on ordered framing and connection-scoped
-//! fail-stop behavior rather than message sequence numbers. It defines no
-//! optional capabilities yet; capability names provide an extension point for
-//! later versions without weakening the v1 decoder.
+//! Protocol version 1 multiplexes session operations and delegate callbacks by
+//! request ID over one ordered connection. It defines no optional capabilities
+//! yet; capability names provide an extension point for later versions without
+//! weakening the v1 decoder.
 
 mod codec;
 mod error;
@@ -17,14 +17,21 @@ pub use error::HandshakeRejectReason;
 pub use message::ClientHello;
 pub use message::ClientHelloError;
 pub use message::ClientToHost;
+pub use message::DelegateRequest;
+pub use message::DelegateResponse;
 pub use message::HostHello;
+pub use message::HostRequest;
+pub use message::HostResponse;
 pub use message::HostToClient;
+pub use message::WireResult;
 pub use types::Capability;
 pub use types::CapabilitySet;
+pub use types::DelegateRequestId;
 pub use types::DuplicateCapability;
 pub use types::InvalidIdentifier;
 pub use types::InvalidSupportedProtocolVersions;
 pub use types::ProtocolVersion;
+pub use types::RequestId;
 pub use types::SessionId;
 pub use types::SupportedProtocolVersions;
 

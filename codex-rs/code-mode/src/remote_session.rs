@@ -1,5 +1,6 @@
+use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::Mutex;
+use std::sync::Mutex as StdMutex;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 
@@ -13,20 +14,30 @@ use codex_code_mode_protocol::ExecuteRequest;
 use codex_code_mode_protocol::StartedCell;
 use codex_code_mode_protocol::WaitOutcome;
 use codex_code_mode_protocol::WaitRequest;
+use codex_code_mode_protocol::host::SessionId;
+use tokio::sync::Semaphore;
 
+use self::connection::Connection;
 use crate::NoopCodeModeSessionDelegate;
 
-/// Creates code-mode sessions backed by one lazily initialized process host.
-///
-/// The transport is not wired up yet. Keeping process ownership in the provider
-/// establishes the intended lifetime: sessions created by one provider share a
-/// host, while each session retains its own delegate and logical session ID.
-#[derive(Default)]
+mod connection;
+
+const CODE_MODE_HOST_PATH_ENV: &str = "CODEX_CODE_MODE_HOST_PATH";
+
+/// Creates code-mode sessions backed by one lazily spawned process host.
 pub struct ProcessOwnedCodeModeSessionProvider {
-    process_host: Mutex<Option<Arc<OwnedProcessHost>>>,
+    host_program: PathBuf,
+    process_host: StdMutex<Option<Arc<OwnedProcessHost>>>,
 }
 
 impl ProcessOwnedCodeModeSessionProvider {
+    pub fn with_host_program(host_program: PathBuf) -> Self {
+        Self {
+            host_program,
+            process_host: StdMutex::new(None),
+        }
+    }
+
     fn process_host(&self) -> Arc<OwnedProcessHost> {
         let mut process_host = self
             .process_host
@@ -36,9 +47,15 @@ impl ProcessOwnedCodeModeSessionProvider {
             return Arc::clone(process_host);
         }
 
-        let new_process_host = Arc::new(OwnedProcessHost::new());
+        let new_process_host = Arc::new(OwnedProcessHost::new(self.host_program.clone()));
         *process_host = Some(Arc::clone(&new_process_host));
         new_process_host
+    }
+}
+
+impl Default for ProcessOwnedCodeModeSessionProvider {
+    fn default() -> Self {
+        Self::with_host_program(default_host_program())
     }
 }
 
@@ -49,59 +66,89 @@ impl CodeModeSessionProvider for ProcessOwnedCodeModeSessionProvider {
     ) -> CodeModeSessionProviderFuture<'a> {
         let session = ProcessOwnedCodeModeSession::with_process_host(delegate, self.process_host());
         Box::pin(async move {
+            session.connection().await?;
             let session: Arc<dyn CodeModeSession> = Arc::new(session);
             Ok(session)
         })
     }
 }
 
-/// Owns the eventual child process and its single event-stream reader/writer.
-///
-/// Transport startup and failure propagation will be added with the remote
-/// protocol. The liveness and session-ID state live here now so that work does
-/// not leak into callers when that transport is introduced.
 struct OwnedProcessHost {
+    host_program: PathBuf,
+    connection: StdMutex<Option<Arc<Connection>>>,
+    spawn_permit: Semaphore,
     next_session_id: AtomicU64,
 }
 
 impl OwnedProcessHost {
-    fn new() -> Self {
+    fn new(host_program: PathBuf) -> Self {
         Self {
+            host_program,
+            connection: StdMutex::new(None),
+            spawn_permit: Semaphore::new(/*permits*/ 1),
             next_session_id: AtomicU64::new(1),
         }
     }
 
-    fn allocate_session_id(&self) -> ProcessSessionId {
-        ProcessSessionId(self.next_session_id.fetch_add(1, Ordering::Relaxed))
+    async fn connection(&self) -> Result<Arc<Connection>, String> {
+        if let Some(connection) = self.live_connection() {
+            return Ok(connection);
+        }
+
+        let _spawn_permit = self
+            .spawn_permit
+            .acquire()
+            .await
+            .map_err(|_| "code-mode host spawn coordinator closed".to_string())?;
+        if let Some(connection) = self.live_connection() {
+            return Ok(connection);
+        }
+        let new_connection = Arc::new(Connection::spawn(&self.host_program).await?);
+        *self
+            .connection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::clone(&new_connection));
+        Ok(new_connection)
     }
 
-    fn unimplemented_operation<T>(
-        &self,
-        session_id: ProcessSessionId,
-        operation: &str,
-    ) -> Result<T, String> {
-        Err(format!(
-            "remote code-mode operation `{operation}` is not implemented for session {}",
-            session_id.0
-        ))
+    fn live_connection(&self) -> Option<Arc<Connection>> {
+        self.connection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .filter(|connection| connection.is_alive())
+            .cloned()
+    }
+
+    fn allocate_session_id(&self) -> SessionId {
+        let value = self.next_session_id.fetch_add(1, Ordering::Relaxed);
+        match SessionId::new(format!("session-{value}")) {
+            Ok(session_id) => session_id,
+            Err(_) => unreachable!("a generated code-mode session ID is nonempty"),
+        }
     }
 }
 
-#[derive(Clone, Copy)]
-struct ProcessSessionId(u64);
+enum SessionState {
+    New,
+    Open(Arc<Connection>),
+    Shutdown,
+}
 
 /// A logical code-mode session assigned to a process-owned host.
 pub struct ProcessOwnedCodeModeSession {
     process_host: Arc<OwnedProcessHost>,
-    session_id: ProcessSessionId,
-    _delegate: Arc<dyn CodeModeSessionDelegate>,
+    session_id: SessionId,
+    delegate: Arc<dyn CodeModeSessionDelegate>,
+    state: StdMutex<SessionState>,
+    transition_permit: Semaphore,
 }
 
 impl ProcessOwnedCodeModeSession {
     pub fn new() -> Self {
         Self::with_process_host(
             Arc::new(NoopCodeModeSessionDelegate),
-            Arc::new(OwnedProcessHost::new()),
+            Arc::new(OwnedProcessHost::new(default_host_program())),
         )
     }
 
@@ -113,27 +160,88 @@ impl ProcessOwnedCodeModeSession {
         Self {
             process_host,
             session_id,
-            _delegate: delegate,
+            delegate,
+            state: StdMutex::new(SessionState::New),
+            transition_permit: Semaphore::new(/*permits*/ 1),
         }
     }
 
-    pub async fn execute(&self, _request: ExecuteRequest) -> Result<StartedCell, String> {
-        self.process_host
-            .unimplemented_operation(self.session_id, "execute")
+    async fn connection(&self) -> Result<Arc<Connection>, String> {
+        if let Some(connection) = self.current_connection()? {
+            return Ok(connection);
+        }
+
+        let _transition_permit = self
+            .transition_permit
+            .acquire()
+            .await
+            .map_err(|_| "code-mode session transition coordinator closed".to_string())?;
+        if let Some(connection) = self.current_connection()? {
+            return Ok(connection);
+        }
+        let connection = self.process_host.connection().await?;
+        connection
+            .open_session(self.session_id.clone(), Arc::clone(&self.delegate))
+            .await?;
+        *self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            SessionState::Open(Arc::clone(&connection));
+        Ok(connection)
     }
 
-    pub async fn wait(&self, _request: WaitRequest) -> Result<WaitOutcome, String> {
-        self.process_host
-            .unimplemented_operation(self.session_id, "wait")
+    fn current_connection(&self) -> Result<Option<Arc<Connection>>, String> {
+        match &*self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        {
+            SessionState::New => Ok(None),
+            SessionState::Open(connection) => Ok(Some(Arc::clone(connection))),
+            SessionState::Shutdown => Err("code mode session is shutting down".to_string()),
+        }
     }
 
-    pub async fn terminate(&self, _cell_id: CellId) -> Result<WaitOutcome, String> {
-        self.process_host
-            .unimplemented_operation(self.session_id, "terminate")
+    pub async fn execute(&self, request: ExecuteRequest) -> Result<StartedCell, String> {
+        self.connection()
+            .await?
+            .execute(self.session_id.clone(), request)
+            .await
+    }
+
+    pub async fn wait(&self, request: WaitRequest) -> Result<WaitOutcome, String> {
+        self.connection()
+            .await?
+            .wait(self.session_id.clone(), request)
+            .await
+    }
+
+    pub async fn terminate(&self, cell_id: CellId) -> Result<WaitOutcome, String> {
+        self.connection()
+            .await?
+            .terminate(self.session_id.clone(), cell_id)
+            .await
     }
 
     pub async fn shutdown(&self) -> Result<(), String> {
-        Ok(())
+        let transition_permit = self
+            .transition_permit
+            .acquire()
+            .await
+            .map_err(|_| "code-mode session transition coordinator closed".to_string())?;
+        let connection = {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            match std::mem::replace(&mut *state, SessionState::Shutdown) {
+                SessionState::Open(connection) => connection,
+                SessionState::New | SessionState::Shutdown => return Ok(()),
+            }
+        };
+        drop(transition_permit);
+        connection.shutdown_session(self.session_id.clone()).await
     }
 }
 
@@ -162,6 +270,26 @@ impl CodeModeSession for ProcessOwnedCodeModeSession {
     fn shutdown<'a>(&'a self) -> CodeModeSessionResultFuture<'a, ()> {
         Box::pin(ProcessOwnedCodeModeSession::shutdown(self))
     }
+}
+
+fn default_host_program() -> PathBuf {
+    if let Some(path) = std::env::var_os(CODE_MODE_HOST_PATH_ENV) {
+        return PathBuf::from(path);
+    }
+    let executable_name = if cfg!(windows) {
+        "codex-code-mode-host.exe"
+    } else {
+        "codex-code-mode-host"
+    };
+    if let Ok(current_exe) = std::env::current_exe()
+        && let Some(parent) = current_exe.parent()
+    {
+        let sibling = parent.join(executable_name);
+        if sibling.is_file() {
+            return sibling;
+        }
+    }
+    PathBuf::from(executable_name)
 }
 
 #[cfg(test)]

@@ -6,10 +6,13 @@ use codex_code_mode_protocol::host::FramedReader;
 use codex_code_mode_protocol::host::FramedWriter;
 use codex_code_mode_protocol::host::HandshakeRejectReason;
 use codex_code_mode_protocol::host::HostHello;
+use codex_code_mode_protocol::host::HostRequest;
+use codex_code_mode_protocol::host::HostResponse;
 use codex_code_mode_protocol::host::HostToClient;
 use codex_code_mode_protocol::host::ProtocolVersion;
 use codex_code_mode_protocol::host::SessionId;
 use codex_code_mode_protocol::host::SupportedProtocolVersions;
+use codex_code_mode_protocol::host::WireResult;
 use pretty_assertions::assert_eq;
 
 use super::run;
@@ -53,50 +56,67 @@ async fn handshake_and_multiple_session_lifecycles_are_ordered() {
         )))
     );
 
-    for id in ["session-1", "session-2"] {
+    for (request_id, id) in [(1, "session-1"), (2, "session-2")] {
         writer
-            .write(&ClientToHost::OpenSession {
-                session_id: session_id(id),
+            .write(&ClientToHost::Request {
+                id: request_id,
+                request: HostRequest::OpenSession {
+                    session_id: session_id(id),
+                },
             })
             .await
             .expect("open session");
         assert_eq!(
             reader.read::<HostToClient>().await.expect("session ready"),
-            Some(HostToClient::SessionReady {
-                session_id: session_id(id),
+            Some(HostToClient::Response {
+                id: request_id,
+                result: WireResult::Ok {
+                    value: HostResponse::SessionReady {
+                        session_id: session_id(id),
+                    },
+                },
             })
         );
     }
 
-    for id in ["session-1", "session-2"] {
+    for (request_id, id) in [(3, "session-1"), (4, "session-2")] {
         writer
-            .write(&ClientToHost::CloseSession {
-                session_id: session_id(id),
+            .write(&ClientToHost::Request {
+                id: request_id,
+                request: HostRequest::ShutdownSession {
+                    session_id: session_id(id),
+                },
             })
             .await
-            .expect("close session");
+            .expect("shutdown session");
         assert_eq!(
             reader.read::<HostToClient>().await.expect("session closed"),
-            Some(HostToClient::SessionClosed {
-                session_id: session_id(id),
+            Some(HostToClient::Response {
+                id: request_id,
+                result: WireResult::Ok {
+                    value: HostResponse::SessionClosed {
+                        session_id: session_id(id),
+                    },
+                },
             })
         );
     }
 
     drop(writer);
+    drop(reader);
     host.await.expect("host task").expect("host connection");
 }
 
 #[tokio::test]
-async fn incompatible_handshake_is_rejected_and_closes_connection() {
+async fn incompatible_or_invalid_handshake_is_rejected() {
     let (host_stream, client_stream) = tokio::io::duplex(/*max_buf_size*/ 1024);
     let (host_reader, host_writer) = tokio::io::split(host_stream);
     let (client_reader, client_writer) = tokio::io::split(client_stream);
     let host = tokio::spawn(run(host_reader, host_writer));
     let mut reader = FramedReader::new(client_reader);
     let mut writer = FramedWriter::new(client_writer);
-
     let version_two = ProtocolVersion::new(/*value*/ 2).expect("protocol version");
+
     writer
         .write(&client_hello([version_two], CapabilitySet::empty()))
         .await
@@ -110,9 +130,30 @@ async fn incompatible_handshake_is_rejected_and_closes_connection() {
             },
         })
     );
+    host.await.expect("host task").expect("host connection");
+
+    let (host_stream, client_stream) = tokio::io::duplex(/*max_buf_size*/ 1024);
+    let (host_reader, host_writer) = tokio::io::split(host_stream);
+    let (client_reader, client_writer) = tokio::io::split(client_stream);
+    let host = tokio::spawn(run(host_reader, host_writer));
+    let mut reader = FramedReader::new(client_reader);
+    let mut writer = FramedWriter::new(client_writer);
+    writer
+        .write(&ClientToHost::Request {
+            id: 1,
+            request: HostRequest::OpenSession {
+                session_id: session_id("session-1"),
+            },
+        })
+        .await
+        .expect("write invalid first message");
     assert_eq!(
-        reader.read::<HostToClient>().await.expect("connection eof"),
-        None
+        reader.read::<HostToClient>().await.expect("rejection"),
+        Some(HostToClient::HandshakeRejected {
+            reason: HandshakeRejectReason::InvalidHello {
+                message: "first message must be connection/hello".to_string(),
+            },
+        })
     );
     host.await.expect("host task").expect("host connection");
 }
@@ -144,68 +185,7 @@ async fn unsupported_required_capability_is_rejected() {
 }
 
 #[tokio::test]
-async fn invalid_message_order_faults_the_connection() {
-    let (host_stream, client_stream) = tokio::io::duplex(/*max_buf_size*/ 1024);
-    let (host_reader, host_writer) = tokio::io::split(host_stream);
-    let (client_reader, client_writer) = tokio::io::split(client_stream);
-    let host = tokio::spawn(run(host_reader, host_writer));
-    let mut reader = FramedReader::new(client_reader);
-    let mut writer = FramedWriter::new(client_writer);
-
-    writer
-        .write(&ClientToHost::OpenSession {
-            session_id: session_id("session-1"),
-        })
-        .await
-        .expect("write invalid first message");
-    assert_eq!(
-        reader.read::<HostToClient>().await.expect("rejection"),
-        Some(HostToClient::HandshakeRejected {
-            reason: HandshakeRejectReason::InvalidHello {
-                message: "first message must be connection/hello".to_string(),
-            },
-        })
-    );
-    assert_eq!(
-        reader.read::<HostToClient>().await.expect("connection eof"),
-        None
-    );
-    host.await.expect("host task").expect("host connection");
-
-    let (host_stream, client_stream) = tokio::io::duplex(/*max_buf_size*/ 1024);
-    let (host_reader, host_writer) = tokio::io::split(host_stream);
-    let (client_reader, client_writer) = tokio::io::split(client_stream);
-    let host = tokio::spawn(run(host_reader, host_writer));
-    let mut reader = FramedReader::new(client_reader);
-    let mut writer = FramedWriter::new(client_writer);
-    writer
-        .write(&client_hello([ProtocolVersion::V1], CapabilitySet::empty()))
-        .await
-        .expect("write hello");
-    reader
-        .read::<HostToClient>()
-        .await
-        .expect("read hello")
-        .expect("host hello");
-    writer
-        .write(&ClientToHost::CloseSession {
-            session_id: session_id("unknown"),
-        })
-        .await
-        .expect("close unknown session");
-    drop(writer);
-    let err = host
-        .await
-        .expect("host task")
-        .expect_err("invalid session transition");
-    assert_eq!(
-        err.to_string(),
-        "cannot close unknown code-mode session `unknown`"
-    );
-}
-
-#[tokio::test]
-async fn session_id_cannot_be_reused_after_close() {
+async fn session_id_cannot_be_reused_after_shutdown() {
     let (host_stream, client_stream) = tokio::io::duplex(/*max_buf_size*/ 2048);
     let (host_reader, host_writer) = tokio::io::split(host_stream);
     let (client_reader, client_writer) = tokio::io::split(client_stream);
@@ -223,40 +203,50 @@ async fn session_id_cannot_be_reused_after_close() {
         .expect("host hello");
 
     let id = session_id("session-1");
+    for (request_id, request) in [
+        (
+            1,
+            HostRequest::OpenSession {
+                session_id: id.clone(),
+            },
+        ),
+        (
+            2,
+            HostRequest::ShutdownSession {
+                session_id: id.clone(),
+            },
+        ),
+    ] {
+        writer
+            .write(&ClientToHost::Request {
+                id: request_id,
+                request,
+            })
+            .await
+            .expect("session request");
+        reader
+            .read::<HostToClient>()
+            .await
+            .expect("session response")
+            .expect("session response message");
+    }
     writer
-        .write(&ClientToHost::OpenSession {
-            session_id: id.clone(),
+        .write(&ClientToHost::Request {
+            id: 3,
+            request: HostRequest::OpenSession { session_id: id },
         })
-        .await
-        .expect("open session");
-    reader
-        .read::<HostToClient>()
-        .await
-        .expect("session ready")
-        .expect("session ready message");
-    writer
-        .write(&ClientToHost::CloseSession {
-            session_id: id.clone(),
-        })
-        .await
-        .expect("close session");
-    reader
-        .read::<HostToClient>()
-        .await
-        .expect("session closed")
-        .expect("session closed message");
-    writer
-        .write(&ClientToHost::OpenSession { session_id: id })
         .await
         .expect("reuse session ID");
-    drop(writer);
-
-    let err = host
-        .await
-        .expect("host task")
-        .expect_err("reused session ID");
     assert_eq!(
-        err.to_string(),
-        "code-mode session ID `session-1` was reused"
+        reader.read::<HostToClient>().await.expect("reuse response"),
+        Some(HostToClient::Response {
+            id: 3,
+            result: WireResult::Err {
+                message: "code-mode session ID `session-1` was reused".to_string(),
+            },
+        })
     );
+    drop(writer);
+    drop(reader);
+    host.await.expect("host task").expect("host connection");
 }
