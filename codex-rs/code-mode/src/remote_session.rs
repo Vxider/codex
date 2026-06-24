@@ -146,8 +146,12 @@ pub struct ProcessOwnedCodeModeSession {
 
 impl ProcessOwnedCodeModeSession {
     pub fn new() -> Self {
+        Self::with_delegate(Arc::new(NoopCodeModeSessionDelegate))
+    }
+
+    pub fn with_delegate(delegate: Arc<dyn CodeModeSessionDelegate>) -> Self {
         Self::with_process_host(
-            Arc::new(NoopCodeModeSessionDelegate),
+            delegate,
             Arc::new(OwnedProcessHost::new(default_host_program())),
         )
     }
