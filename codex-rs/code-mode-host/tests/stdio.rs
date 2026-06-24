@@ -393,6 +393,7 @@ async fn explicit_yield_frame_precedes_notification_and_terminal_output_drops_ti
             id: 2,
             request: HostRequest::Execute {
                 session_id: session_id.clone(),
+                cell_id: cell_id("client-cell"),
                 request: execute_request(
                     r#"
 text("hello");
@@ -415,7 +416,7 @@ setTimeout(() => { text("should never emit"); }, 60000);
             id: 2,
             result: WireResult::Ok {
                 value: HostResponse::ExecutionStarted {
-                    cell_id: cell_id("1"),
+                    cell_id: cell_id("client-cell"),
                 },
             },
         })
@@ -429,7 +430,7 @@ setTimeout(() => { text("should never emit"); }, 60000);
             id: 2,
             result: WireResult::Ok {
                 value: RuntimeResponse::Yielded {
-                    cell_id: cell_id("1"),
+                    cell_id: cell_id("client-cell"),
                     content_items: vec![FunctionCallOutputContentItem::InputText {
                         text: "hello".to_string(),
                     }],
@@ -455,7 +456,7 @@ setTimeout(() => { text("should never emit"); }, 60000);
         }) => {
             assert_eq!(callback_session_id, session_id);
             assert_eq!(call_id, "call-1");
-            assert_eq!(callback_cell_id, cell_id("1"));
+            assert_eq!(callback_cell_id, cell_id("client-cell"));
             assert_eq!(text, "this is important");
             id
         }
@@ -476,7 +477,7 @@ setTimeout(() => { text("should never emit"); }, 60000);
             request: HostRequest::Wait {
                 session_id: session_id.clone(),
                 request: WaitRequest {
-                    cell_id: cell_id("1"),
+                    cell_id: cell_id("client-cell"),
                     yield_time_ms: 60_000,
                 },
             },
@@ -496,7 +497,7 @@ setTimeout(() => { text("should never emit"); }, 60000);
                 cell_id: closed_cell_id,
             }) => {
                 assert_eq!(closed_session_id, session_id);
-                assert_eq!(closed_cell_id, cell_id("1"));
+                assert_eq!(closed_cell_id, cell_id("client-cell"));
             }
             message => panic!("unexpected terminal frame: {message:?}"),
         }
@@ -506,7 +507,7 @@ setTimeout(() => { text("should never emit"); }, 60000);
         WireResult::Ok {
             value: HostResponse::WaitCompleted {
                 outcome: WaitOutcome::LiveCell(RuntimeResponse::Result {
-                    cell_id: cell_id("1"),
+                    cell_id: cell_id("client-cell"),
                     content_items: vec![FunctionCallOutputContentItem::InputText {
                         text: "world".to_string(),
                     }],
@@ -703,7 +704,7 @@ async fn closed_host_stdout_terminates_the_spawned_process() {
 
 #[cfg(unix)]
 #[tokio::test]
-async fn crashed_host_fails_in_flight_exec_and_next_exec_respawns() {
+async fn crashed_host_recovery_does_not_reuse_cell_ids() {
     use std::os::unix::fs::PermissionsExt;
 
     let host_binary =
@@ -745,15 +746,40 @@ async fn crashed_host_fails_in_flight_exec_and_next_exec_respawns() {
         "unexpected error: {error}"
     );
 
+    let mut recovered_request = execute_request("await new Promise(() => {});");
+    recovered_request.yield_time_ms = Some(1);
+    let recovered = session
+        .execute(recovered_request)
+        .await
+        .expect("start recovered execution");
+    assert_eq!(recovered.cell_id, cell_id("2"));
     assert_eq!(
-        execute(&session, execute_request(r#"text("recovered");"#)).await,
-        RuntimeResponse::Result {
+        recovered.initial_response().await,
+        Ok(RuntimeResponse::Yielded {
+            cell_id: cell_id("2"),
+            content_items: Vec::new(),
+        })
+    );
+    assert_eq!(
+        session
+            .terminate(cell_id("1"))
+            .await
+            .expect("terminate stale cell"),
+        WaitOutcome::MissingCell(RuntimeResponse::Result {
             cell_id: cell_id("1"),
-            content_items: vec![FunctionCallOutputContentItem::InputText {
-                text: "recovered".to_string(),
-            }],
-            error_text: None,
-        }
+            content_items: Vec::new(),
+            error_text: Some("exec cell 1 not found".to_string()),
+        })
+    );
+    assert_eq!(
+        session
+            .terminate(cell_id("2"))
+            .await
+            .expect("terminate recovered cell"),
+        WaitOutcome::LiveCell(RuntimeResponse::Terminated {
+            cell_id: cell_id("2"),
+            content_items: Vec::new(),
+        })
     );
     let pids = recorded_pids(&pid_log);
     assert_eq!(pids.len(), 2);

@@ -142,6 +142,7 @@ enum SessionState {
 pub struct ProcessOwnedCodeModeSession {
     process_host: Arc<OwnedProcessHost>,
     session_id: SessionId,
+    next_cell_id: AtomicU64,
     delegate: Arc<dyn CodeModeSessionDelegate>,
     state: StdMutex<SessionState>,
     transition_permit: Semaphore,
@@ -163,6 +164,7 @@ impl ProcessOwnedCodeModeSession {
         Self {
             process_host,
             session_id,
+            next_cell_id: AtomicU64::new(1),
             delegate,
             state: StdMutex::new(SessionState::New),
             transition_permit: Semaphore::new(/*permits*/ 1),
@@ -213,10 +215,19 @@ impl ProcessOwnedCodeModeSession {
     }
 
     pub async fn execute(&self, request: ExecuteRequest) -> Result<StartedCell, String> {
+        let cell_id = self.allocate_cell_id();
         self.connection()
             .await?
-            .execute(self.session_id.clone(), request)
+            .execute(self.session_id.clone(), cell_id, request)
             .await
+    }
+
+    fn allocate_cell_id(&self) -> CellId {
+        CellId::new(
+            self.next_cell_id
+                .fetch_add(1, Ordering::Relaxed)
+                .to_string(),
+        )
     }
 
     pub async fn wait(&self, request: WaitRequest) -> Result<WaitOutcome, String> {
